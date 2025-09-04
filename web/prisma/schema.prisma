@@ -1,0 +1,234 @@
+// prisma/schema.prisma
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+/* ==== ENUMS ==== */
+enum RoomType {
+  LECTURE
+  LAB
+  SEMINAR
+}
+
+enum DayOfWeek {
+  MON
+  TUE
+  WED
+  THU
+  FRI
+  SAT
+  SUN
+}
+
+enum ScheduleStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+enum MemberRole {
+  MEMBER
+  LEADER
+}
+
+/* ==== CORE ENTITIES ==== */
+model Teacher {
+  id               Int      @id @default(autoincrement())
+  name             String
+  dept             String?
+  maxHoursPerWeek  Int      @default(20)
+  unavailableJson  Json?    // [{ day: "MON", slotIndexes: [1,2] }, ...]
+  // relations
+  assignments      TeachingAssignment[]
+  lessons          Lesson[]
+  // audit
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@index([name])
+}
+
+model Subject {
+  id               Int      @id @default(autoincrement())
+  code             String   @unique
+  name             String
+  periodsPerWeek   Int
+  requiresRoomType RoomType?
+  groupable        Boolean  @default(false)
+  dept             String?
+  // relations
+  assignments      TeachingAssignment[]
+  lessons          Lesson[]
+  // audit
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@index([code])
+}
+
+model Room {
+  id        Int      @id @default(autoincrement())
+  name      String   @unique
+  capacity  Int
+  roomType  RoomType
+  lessons   Lesson[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Timeslot {
+  id        Int       @id @default(autoincrement())
+  day       DayOfWeek
+  index     Int       // 1..N ภายในวัน
+  startTime String
+  endTime   String
+  lessons   Lesson[]
+
+  @@unique([day, index])   // composite unique: where: { day_index: { day, index } }
+}
+
+/* ==== STUDENTS & GROUPS ==== */
+model Student {
+  id           Int        @id @default(autoincrement())
+  code         String     @unique
+  name         String
+  dept         String?
+  level        Int?
+  specialNotes String[]?  // Postgres text[] for notes/เงื่อนไขพิเศษ
+  members      GroupMember[]
+  enrolls      Enrollment[]
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  @@index([name])
+}
+
+model Group {
+  id          Int                 @id @default(autoincrement())
+  name        String              @unique
+  dept        String?
+  level       Int?
+  size        Int                 @default(0)
+  members     GroupMember[]
+  enrolls     Enrollment[]
+  assignments TeachingAssignment[]
+  lessons     Lesson[]
+  // กลุ่มคู่ขนาน (parallel/co-teach)
+  parallelsA  GroupParallel[]     @relation("GroupParallelA")
+  parallelsB  GroupParallel[]     @relation("GroupParallelB")
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+}
+
+model GroupMember {
+  id        Int       @id @default(autoincrement())
+  groupId   Int
+  studentId Int
+  role      MemberRole @default(MEMBER)
+  term      String?
+  joinedAt  DateTime  @default(now())
+  leftAt    DateTime?
+
+  group   Group   @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  student Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  @@unique([groupId, studentId, term])  // นักเรียน 1 คน อยู่กลุ่มเดิมซ้ำ term เดียวกันไม่ได้
+  @@index([studentId])
+}
+
+/* ==== TEACHING & SCHEDULING ==== */
+model TeachingAssignment {
+  id              Int     @id @default(autoincrement())
+  subjectId       Int
+  teacherId       Int
+  groupId         Int
+  term            String?
+  requiredPeriods Int     @default(1)
+
+  subject Subject @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+  teacher Teacher @relation(fields: [teacherId], references: [id], onDelete: Cascade)
+  group   Group   @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  lessons Lesson[]
+
+  @@unique([subjectId, teacherId, groupId, term]) // กันซ้ำการมอบหมาย
+  @@index([teacherId])
+  @@index([groupId])
+}
+
+model Schedule {
+  id          Int             @id @default(autoincrement())
+  term        String
+  status      ScheduleStatus  @default(DRAFT)
+  notes       Json?
+  createdAt   DateTime        @default(now())
+  publishedAt DateTime?
+  lessons     Lesson[]
+
+  @@index([term])
+}
+
+model Lesson {
+  id           Int      @id @default(autoincrement())
+  scheduleId   Int
+  subjectId    Int
+  teacherId    Int
+  groupId      Int
+  roomId       Int
+  timeslotId   Int
+  assignmentId Int?
+
+  schedule   Schedule           @relation(fields: [scheduleId], references: [id], onDelete: Cascade)
+  subject    Subject            @relation(fields: [subjectId], references: [id], onDelete: Restrict)
+  teacher    Teacher            @relation(fields: [teacherId], references: [id], onDelete: Restrict)
+  group      Group              @relation(fields: [groupId], references: [id], onDelete: Restrict)
+  room       Room               @relation(fields: [roomId], references: [id], onDelete: Restrict)
+  timeslot   Timeslot           @relation(fields: [timeslotId], references: [id], onDelete: Restrict)
+  assignment TeachingAssignment @relation(fields: [assignmentId], references: [id], onDelete: SetNull)
+
+  // ป้องกันชนคาบในระดับฐานข้อมูล
+  @@unique([scheduleId, timeslotId, roomId])    // ห้องเดียว-คาบเดียว ห้ามมีมากกว่า 1 วิชา
+  @@unique([scheduleId, timeslotId, teacherId]) // ครูคนเดียว-คาบเดียว ห้ามชน
+  @@unique([scheduleId, timeslotId, groupId])   // กลุ่มเดียว-คาบเดียว ห้ามชน
+
+  @@index([subjectId])
+}
+
+/* การลงทะเบียนเรียนรายวิชา ต่อ term (อิสระจากกลุ่ม) */
+model Enrollment {
+  id        Int      @id @default(autoincrement())
+  studentId Int
+  subjectId Int
+  term      String
+  groupId   Int?
+
+  student Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  subject Subject @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+  group   Group?  @relation(fields: [groupId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@unique([studentId, subjectId, term])
+  @@index([subjectId])
+}
+
+/* กลุ่มคู่ขนาน: สองกลุ่มเรียนพร้อมกัน/แชร์คาบ/สอนร่วม */
+model GroupParallel {
+  id       Int    @id @default(autoincrement())
+  term     String?
+  groupAId Int
+  groupBId Int
+
+  groupA Group @relation("GroupParallelA", fields: [groupAId], references: [id], onDelete: Cascade)
+  groupB Group @relation("GroupParallelB", fields: [groupBId], references: [id], onDelete: Cascade)
+
+  @@unique([term, groupAId, groupBId])
+  @@index([groupBId])
+}
+
+

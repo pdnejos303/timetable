@@ -1,0 +1,9 @@
+﻿solver/.venv/
+solver/__pycache__/
+*.pyc
+web/node_modules/
+web/.next/
+*.env
+*.env.*
+!web/.env.example
+!solver/.env.example
