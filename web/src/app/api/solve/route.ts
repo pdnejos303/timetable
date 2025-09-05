@@ -1,121 +1,223 @@
 // web/src/app/api/solve/route.ts
 import { NextRequest, NextResponse } from "next/server";
-import { prisma } from "@/lib/prisma";
-import type { SolveInput, SolveOutput } from "@/lib/types";
 import axios from "axios";
+import { prisma } from "@/lib/prisma";
+import type {
+  SolveInput,
+  SolveOutput,
+  Unavail,
+  LessonOut,
+  SolverConfig,
+} from "@/lib/types";
 
-// ---- Helper: type guards (no any) ----
-type Unavail = { day: string; slotIndexes: number[] };
+const SOLVER_API_URL =
+  process.env.SOLVER_API_URL?.trim() || "http://localhost:8000/solve";
+const SOLVER_TIMEOUT_MS = Number(process.env.SOLVER_TIMEOUT_MS || 60_000);
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null;
 }
-function isUnavail(v: unknown): v is Unavail {
-  if (!isRecord(v)) return false;
-  const dayOk = typeof v.day === "string";
-  const slots = v.slotIndexes;
-  const slotsOk = Array.isArray(slots) && slots.every((n) => typeof n === "number");
-  return dayOk && slotsOk;
-}
-function parseUnavail(v: unknown): Unavail[] {
-  return Array.isArray(v) ? v.filter(isUnavail) : [];
+
+function parseUnavail(jsonValue: unknown): Unavail[] {
+  if (!jsonValue) return [];
+  try {
+    const arr = Array.isArray(jsonValue) ? jsonValue : JSON.parse(String(jsonValue));
+    if (!Array.isArray(arr)) return [];
+    const result: Unavail[] = [];
+    for (const item of arr) {
+      if (!isRecord(item)) continue;
+      const day = typeof item.day === "string" ? item.day : null;
+      const slots = Array.isArray(item.slotIndexes)
+        ? (item.slotIndexes as unknown[]).filter((x) => Number.isInteger(x)).map((x) => Number(x))
+        : [];
+      if (day) result.push({ day, slotIndexes: slots });
+    }
+    return result;
+  } catch {
+    return [];
+  }
 }
 
-// ---- Type aliases from prisma return types (ไม่พึ่ง @prisma/client model types) ----
-type DbTeacher = Awaited<ReturnType<typeof prisma.teacher.findMany>>[number];
-type DbSubject = Awaited<ReturnType<typeof prisma.subject.findMany>>[number];
-type DbRoom = Awaited<ReturnType<typeof prisma.room.findMany>>[number];
-type DbGroup = Awaited<ReturnType<typeof prisma.group.findMany>>[number];
-type DbAssignment = Awaited<ReturnType<typeof prisma.teachingAssignment.findMany>>[number];
-type DbTimeslot = Awaited<ReturnType<typeof prisma.timeslot.findMany>>[number];
+async function buildGroupParallels(term: string): Promise<Map<number, number[]>> {
+  // โหลด edges จากตาราง groupParallel (หนึ่งครั้งพอ)
+  const edges = await prisma.groupParallel.findMany({
+    where: { term },
+    select: { groupAId: true, groupBId: true },
+  });
+
+  const adj = new Map<number, Set<number>>();
+  for (const e of edges) {
+    if (!adj.has(e.groupAId)) adj.set(e.groupAId, new Set());
+    if (!adj.has(e.groupBId)) adj.set(e.groupBId, new Set());
+    adj.get(e.groupAId)!.add(e.groupBId);
+    adj.get(e.groupBId)!.add(e.groupAId);
+  }
+
+  const parallelMap = new Map<number, number[]>();
+  for (const [gid, set] of adj) parallelMap.set(gid, Array.from(set));
+  return parallelMap;
+}
+
+function dayToString(day: string): string {
+  return String(day).toUpperCase();
+}
 
 export async function POST(req: NextRequest) {
   try {
-    const body = (await req.json().catch(() => ({}))) as { term?: string };
-    const term = body.term ?? "2025-T1";
+    const body = (await req.json().catch(() => ({}))) as {
+      term?: string;
+      config?: Partial<SolverConfig>;
+    };
+    const term = body.term?.trim() || "2025-T1";
 
-    const teachers: DbTeacher[] = await prisma.teacher.findMany();
-    const subjects: DbSubject[] = await prisma.subject.findMany();
-    const rooms: DbRoom[] = await prisma.room.findMany();
-    const groups: DbGroup[] = await prisma.group.findMany();
-    const assignments: DbAssignment[] = await prisma.teachingAssignment.findMany();
-    const timeslots: DbTimeslot[] = await prisma.timeslot.findMany({
-      orderBy: [{ day: "asc" }, { index: "asc" }],
-    });
+    const [teachers, subjects, rooms, groups, assignments, timeslots] =
+      await Promise.all([
+        prisma.teacher.findMany({}),
+        prisma.subject.findMany({}),
+        prisma.room.findMany({}),
+        prisma.group.findMany({}),
+        prisma.teachingAssignment.findMany({
+          where: { OR: [{ term }, { term: null }] },
+        }),
+        prisma.timeslot.findMany({
+          orderBy: [{ day: "asc" }, { index: "asc" }],
+        }),
+      ]);
+
+    const assignmentKey = (a: {
+      subjectId: number;
+      teacherId: number;
+      groupId: number;
+      term: string | null;
+    }) => `${a.subjectId}:${a.teacherId}:${a.groupId}:${a.term ?? ""}`;
+
+    const assignmentMap = new Map<string, number>();
+    for (const a of assignments) {
+      assignmentMap.set(
+        assignmentKey({
+          subjectId: a.subjectId,
+          teacherId: a.teacherId,
+          groupId: a.groupId,
+          term: a.term ?? null,
+        }),
+        a.id
+      );
+    }
+
+    const parallelMap = await buildGroupParallels(term);
 
     const input: SolveInput = {
-      term,
-      teachers: teachers.map((t: DbTeacher) => ({
+      timeslots: timeslots.map((t) => ({
         id: t.id,
-        name: t.name,
-        maxHoursPerWeek: t.maxHoursPerWeek,
+        day: dayToString(t.day),
+        index: t.index,
+        // isBreak: ไม่มีใน DB ตอนนี้ หากมีฟิลด์ค่อย map เพิ่ม
+      })),
+      rooms: rooms.map((r) => ({
+        id: r.id,
+        name: r.name ?? undefined,
+        capacity: r.capacity,
+        roomType: r.roomType ?? undefined,
+      })),
+      teachers: teachers.map((t) => ({
+        id: t.id,
+        name: t.name ?? undefined,
+        maxHoursPerWeek: t.maxHoursPerWeek ?? undefined,
+        // maxPeriodsPerDay: ยังไม่มีใน schema → undefined
         unavailable: parseUnavail(t.unavailableJson as unknown),
       })),
-      subjects: subjects.map((s: DbSubject) => ({
+      subjects: subjects.map((s) => ({
         id: s.id,
-        code: s.code,
-        name: s.name,
-        requiresRoomType: s.requiresRoomType ? String(s.requiresRoomType) : undefined,
+        name: s.name ?? undefined,
+        roomType: s.requiresRoomType ? String(s.requiresRoomType) : undefined,
       })),
-      rooms: rooms.map((r: DbRoom) => ({
-        id: r.id,
-        name: r.name,
-        capacity: r.capacity,
-        roomType: String(r.roomType),
+      groups: groups.map((g) => ({
+        id: g.id,
+        name: g.name ?? undefined,
+        size: g.size,
+        parallelWithIds: parallelMap.get(g.id) ?? [],   // ★★ FIX: ใส่ให้ครบตาม GroupIn
+        // maxPeriodsPerDay / unavailable: ยังไม่มีใน schema
       })),
-      groups: groups.map((g: DbGroup) => ({ id: g.id, name: g.name, size: g.size })),
-      assignments: assignments.map((a: DbAssignment) => ({
+      assignments: assignments.map((a) => ({
         id: a.id,
         subjectId: a.subjectId,
         teacherId: a.teacherId,
         groupId: a.groupId,
-        requiredPeriods: a.requiredPeriods,
+        requiredPeriods: a.requiredPeriods ?? 1,
+        // doublePeriod / preferredRoomType: ยังไม่มีใน schema
       })),
-      timeslots: timeslots.map((t: DbTimeslot) => ({
-        id: t.id,
-        day: String(t.day),
-        index: t.index,
-      })),
+      config: {
+        subjectPerDayLimit: body.config?.subjectPerDayLimit ?? 1,
+        avoidFirstPeriod: body.config?.avoidFirstPeriod ?? true,
+        avoidLastPeriod: body.config?.avoidLastPeriod ?? true,
+        avoidIndices: body.config?.avoidIndices ?? [],
+        solverTimeLimitSec:
+          body.config?.solverTimeLimitSec ??
+          Number(process.env.SOLVER_TIME_LIMIT_SEC || 15),
+        randomSeed: body.config?.randomSeed,
+        parallelPolicy: body.config?.parallelPolicy ?? "BLOCK",
+      },
     };
 
-    const url = process.env.SOLVER_API_URL;
-    if (!url) {
+    const { data } = await axios.post<SolveOutput>(SOLVER_API_URL, input, {
+      timeout: SOLVER_TIMEOUT_MS,
+      headers: { "Content-Type": "application/json" },
+    });
+
+    if (!data || !Array.isArray(data.lessons) || data.lessons.length === 0) {
       return NextResponse.json(
-        { ok: false, error: "SOLVER_API_URL is not set" },
-        { status: 500 }
+        {
+          ok: false,
+          error:
+            "Solver ไม่ได้คืน lessons — ตรวจสอบคอนสเตรนต์/ข้อมูลอินพุต",
+          notes: data?.notes ?? [],
+        },
+        { status: 400 }
       );
     }
 
-    const { data } = await axios.post<SolveOutput>(url, input, { timeout: 60_000 });
+    const schedule = await prisma.$transaction(async (tx) => {
+      const sc = await tx.schedule.create({
+        data: {
+          term,
+          notes: (data.notes ?? []) as unknown as string,
+        },
+      });
 
-    const schedule = await prisma.schedule.create({ data: { term, status: "DRAFT" } });
+      const lessonRows = (data.lessons as LessonOut[]).map((L) => {
+        const akey = assignmentKey({
+          subjectId: L.subjectId,
+          teacherId: L.teacherId,
+          groupId: L.groupId,
+          term,
+        });
+        const assignmentId = assignmentMap.get(akey) ?? null;
 
-    if (data.lessons?.length) {
-      await prisma.$transaction(
-        data.lessons.map((L) =>
-          prisma.lesson.create({
-            data: {
-              scheduleId: schedule.id,
-              subjectId: L.subjectId,
-              teacherId: L.teacherId,
-              groupId: L.groupId,
-              roomId: L.roomId,
-              timeslotId: L.timeslotId,
-            },
-          })
-        )
-      );
-    }
+        return {
+          scheduleId: sc.id,
+          subjectId: L.subjectId,
+          teacherId: L.teacherId,
+          groupId: L.groupId,
+          roomId: L.roomId,
+          timeslotId: L.timeslotId,
+          assignmentId,
+        };
+      });
+
+      await tx.lesson.createMany({ data: lessonRows, skipDuplicates: true });
+
+      return sc;
+    });
 
     return NextResponse.json({
       ok: true,
       scheduleId: schedule.id,
-      count: data.lessons?.length ?? 0,
+      count: data.lessons.length,
       objectiveScore: data.objectiveScore,
       notes: data.notes,
     });
   } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : String(err);
-    return NextResponse.json({ ok: false, error: message }, { status: 500 });
+    const msg = err instanceof Error ? err.message : String(err);
+    return NextResponse.json({ ok: false, error: msg }, { status: 500 });
   }
 }

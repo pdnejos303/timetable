@@ -9,7 +9,11 @@ datasource db {
   directUrl = env("DIRECT_URL")
 }
 
-/* ==== ENUMS ==== */
+/**
+ * ─────────────────────────
+ * ENUMS
+ * ─────────────────────────
+ */
 enum RoomType {
   LECTURE
   LAB
@@ -37,39 +41,47 @@ enum MemberRole {
   LEADER
 }
 
-/* ==== CORE ENTITIES ==== */
+/**
+ * ─────────────────────────
+ * CORE ENTITIES
+ * ─────────────────────────
+ */
 model Teacher {
-  id               Int      @id @default(autoincrement())
-  name             String
-  dept             String?
-  maxHoursPerWeek  Int      @default(20)
-  unavailableJson  Json?    // [{ day: "MON", slotIndexes: [1,2] }, ...]
+  id              Int                  @id @default(autoincrement())
+  name            String
+  dept            String?
+  maxHoursPerWeek Int                  @default(20)
+  unavailableJson Json? // [{ day: "MON", slotIndexes: [1,2] }, ...]
   // relations
-  assignments      TeachingAssignment[]
-  lessons          Lesson[]
+  assignments     TeachingAssignment[]
+  lessons         Lesson[]
   // audit
-  createdAt        DateTime @default(now())
-  updatedAt        DateTime @updatedAt
+  createdAt       DateTime             @default(now())
+  updatedAt       DateTime             @updatedAt
 
   @@index([name])
+  @@index([dept])
 }
 
 model Subject {
-  id               Int      @id @default(autoincrement())
-  code             String   @unique
+  id               Int                  @id @default(autoincrement())
+  code             String               @unique
   name             String
   periodsPerWeek   Int
   requiresRoomType RoomType?
-  groupable        Boolean  @default(false)
+  groupable        Boolean              @default(false)
   dept             String?
   // relations
   assignments      TeachingAssignment[]
   lessons          Lesson[]
+  enrolls          Enrollment[] // ⬅️ ฝั่งตรงข้ามของ Enrollment.subject
   // audit
-  createdAt        DateTime @default(now())
-  updatedAt        DateTime @updatedAt
+  createdAt        DateTime             @default(now())
+  updatedAt        DateTime             @updatedAt
 
   @@index([code])
+  @@index([name])
+  @@index([dept])
 }
 
 model Room {
@@ -80,69 +92,91 @@ model Room {
   lessons   Lesson[]
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  @@index([roomType])
+  @@index([capacity])
 }
 
 model Timeslot {
   id        Int       @id @default(autoincrement())
   day       DayOfWeek
-  index     Int       // 1..N ภายในวัน
+  index     Int // 1..N ภายในวัน
   startTime String
   endTime   String
   lessons   Lesson[]
+  // audit
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
 
-  @@unique([day, index])   // composite unique: where: { day_index: { day, index } }
+  @@unique([day, index])
+  @@index([day])
+  @@index([index])
 }
 
-/* ==== STUDENTS & GROUPS ==== */
+/**
+ * ─────────────────────────
+ * STUDENTS & GROUPS
+ * ─────────────────────────
+ */
 model Student {
-  id           Int        @id @default(autoincrement())
-  code         String     @unique
+  id           Int           @id @default(autoincrement())
+  code         String        @unique
   name         String
   dept         String?
   level        Int?
-  specialNotes String[]?  // Postgres text[] for notes/เงื่อนไขพิเศษ
+  specialNotes String[]      @default([]) // Prisma ไม่รองรับ optional list → ใช้ default ว่าง
   members      GroupMember[]
   enrolls      Enrollment[]
-  createdAt    DateTime   @default(now())
-  updatedAt    DateTime   @updatedAt
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
 
   @@index([name])
+  @@index([dept])
+  @@index([level])
 }
 
 model Group {
-  id          Int                 @id @default(autoincrement())
-  name        String              @unique
+  id          Int                  @id @default(autoincrement())
+  name        String               @unique
   dept        String?
   level       Int?
-  size        Int                 @default(0)
+  size        Int                  @default(0)
   members     GroupMember[]
   enrolls     Enrollment[]
   assignments TeachingAssignment[]
   lessons     Lesson[]
   // กลุ่มคู่ขนาน (parallel/co-teach)
-  parallelsA  GroupParallel[]     @relation("GroupParallelA")
-  parallelsB  GroupParallel[]     @relation("GroupParallelB")
-  createdAt   DateTime            @default(now())
-  updatedAt   DateTime            @updatedAt
+  parallelsA  GroupParallel[]      @relation("GroupParallelA")
+  parallelsB  GroupParallel[]      @relation("GroupParallelB")
+  createdAt   DateTime             @default(now())
+  updatedAt   DateTime             @updatedAt
+
+  @@index([dept])
+  @@index([level])
 }
 
 model GroupMember {
-  id        Int       @id @default(autoincrement())
+  id        Int        @id @default(autoincrement())
   groupId   Int
   studentId Int
   role      MemberRole @default(MEMBER)
   term      String?
-  joinedAt  DateTime  @default(now())
+  joinedAt  DateTime   @default(now())
   leftAt    DateTime?
 
   group   Group   @relation(fields: [groupId], references: [id], onDelete: Cascade)
   student Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
 
-  @@unique([groupId, studentId, term])  // นักเรียน 1 คน อยู่กลุ่มเดิมซ้ำ term เดียวกันไม่ได้
+  @@unique([groupId, studentId, term]) // หมายเหตุ: NULL ใน composite unique อนุญาตซ้ำได้ (ข้อจำกัดเชิง DB)
   @@index([studentId])
+  @@index([groupId, term])
 }
 
-/* ==== TEACHING & SCHEDULING ==== */
+/**
+ * ─────────────────────────
+ * TEACHING & SCHEDULING
+ * ─────────────────────────
+ */
 model TeachingAssignment {
   id              Int     @id @default(autoincrement())
   subjectId       Int
@@ -151,30 +185,34 @@ model TeachingAssignment {
   term            String?
   requiredPeriods Int     @default(1)
 
-  subject Subject @relation(fields: [subjectId], references: [id], onDelete: Cascade)
-  teacher Teacher @relation(fields: [teacherId], references: [id], onDelete: Cascade)
-  group   Group   @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  subject Subject  @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+  teacher Teacher  @relation(fields: [teacherId], references: [id], onDelete: Cascade)
+  group   Group    @relation(fields: [groupId], references: [id], onDelete: Cascade)
   lessons Lesson[]
 
-  @@unique([subjectId, teacherId, groupId, term]) // กันซ้ำการมอบหมาย
+  @@unique([subjectId, teacherId, groupId, term])
   @@index([teacherId])
   @@index([groupId])
+  @@index([term])
+  @@index([subjectId, groupId, term])
 }
 
 model Schedule {
-  id          Int             @id @default(autoincrement())
+  id          Int            @id @default(autoincrement())
   term        String
-  status      ScheduleStatus  @default(DRAFT)
+  status      ScheduleStatus @default(DRAFT)
   notes       Json?
-  createdAt   DateTime        @default(now())
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
   publishedAt DateTime?
   lessons     Lesson[]
 
   @@index([term])
+  @@index([status])
 }
 
 model Lesson {
-  id           Int      @id @default(autoincrement())
+  id           Int  @id @default(autoincrement())
   scheduleId   Int
   subjectId    Int
   teacherId    Int
@@ -183,43 +221,56 @@ model Lesson {
   timeslotId   Int
   assignmentId Int?
 
-  schedule   Schedule           @relation(fields: [scheduleId], references: [id], onDelete: Cascade)
-  subject    Subject            @relation(fields: [subjectId], references: [id], onDelete: Restrict)
-  teacher    Teacher            @relation(fields: [teacherId], references: [id], onDelete: Restrict)
-  group      Group              @relation(fields: [groupId], references: [id], onDelete: Restrict)
-  room       Room               @relation(fields: [roomId], references: [id], onDelete: Restrict)
-  timeslot   Timeslot           @relation(fields: [timeslotId], references: [id], onDelete: Restrict)
-  assignment TeachingAssignment @relation(fields: [assignmentId], references: [id], onDelete: SetNull)
+  schedule   Schedule            @relation(fields: [scheduleId], references: [id], onDelete: Cascade)
+  subject    Subject             @relation(fields: [subjectId], references: [id], onDelete: Restrict)
+  teacher    Teacher             @relation(fields: [teacherId], references: [id], onDelete: Restrict)
+  group      Group               @relation(fields: [groupId], references: [id], onDelete: Restrict)
+  room       Room                @relation(fields: [roomId], references: [id], onDelete: Restrict)
+  timeslot   Timeslot            @relation(fields: [timeslotId], references: [id], onDelete: Restrict)
+  assignment TeachingAssignment? @relation(fields: [assignmentId], references: [id], onDelete: SetNull) // ⬅️ ทำให้ optional ให้สอดคล้องกับ assignmentId
 
-  // ป้องกันชนคาบในระดับฐานข้อมูล
-  @@unique([scheduleId, timeslotId, roomId])    // ห้องเดียว-คาบเดียว ห้ามมีมากกว่า 1 วิชา
-  @@unique([scheduleId, timeslotId, teacherId]) // ครูคนเดียว-คาบเดียว ห้ามชน
-  @@unique([scheduleId, timeslotId, groupId])   // กลุ่มเดียว-คาบเดียว ห้ามชน
-
+  // กันชนคาบในระดับ DB
+  @@unique([scheduleId, timeslotId, roomId])
+  @@unique([scheduleId, timeslotId, teacherId])
+  @@unique([scheduleId, timeslotId, groupId])
   @@index([subjectId])
+  @@index([scheduleId, timeslotId])
+  @@index([scheduleId, groupId])
+  @@index([scheduleId, teacherId])
 }
 
-/* การลงทะเบียนเรียนรายวิชา ต่อ term (อิสระจากกลุ่ม) */
+/**
+ * ─────────────────────────
+ * Enrollment ต่อ term (อิสระจากกลุ่ม)
+ * ─────────────────────────
+ */
 model Enrollment {
-  id        Int      @id @default(autoincrement())
+  id        Int    @id @default(autoincrement())
   studentId Int
   subjectId Int
   term      String
   groupId   Int?
 
   student Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
-  subject Subject @relation(fields: [subjectId], references: [id], onDelete: Cascade)
-  group   Group?  @relation(fields: [groupId], references: [id])
+  subject Subject @relation(fields: [subjectId], references: [id], onDelete: Cascade) // ⬅️ ตรงกับ Subject.enrolls
+  group   Group?  @relation(fields: [groupId], references: [id], onDelete: SetNull)
 
   createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   @@unique([studentId, subjectId, term])
   @@index([subjectId])
+  @@index([groupId])
+  @@index([term])
 }
 
-/* กลุ่มคู่ขนาน: สองกลุ่มเรียนพร้อมกัน/แชร์คาบ/สอนร่วม */
+/**
+ * ─────────────────────────
+ * กลุ่มคู่ขนาน (A,B) — (B,A) แนะนำกันซ้ำเพิ่มใน logic แอป
+ * ─────────────────────────
+ */
 model GroupParallel {
-  id       Int    @id @default(autoincrement())
+  id       Int     @id @default(autoincrement())
   term     String?
   groupAId Int
   groupBId Int
@@ -227,8 +278,10 @@ model GroupParallel {
   groupA Group @relation("GroupParallelA", fields: [groupAId], references: [id], onDelete: Cascade)
   groupB Group @relation("GroupParallelB", fields: [groupBId], references: [id], onDelete: Cascade)
 
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
   @@unique([term, groupAId, groupBId])
   @@index([groupBId])
+  @@index([term])
 }
-
-
